@@ -122,12 +122,14 @@ class RAGService:
 
         # Search for relevant documents
         t = time.perf_counter()
-        docs = self._search_documents(query_embedding, timings, match, event)
+        title_hits: list = []
+        docs = self._search_documents(query_embedding, timings, match, event, title_hits)
         timings["search_total"] = _ms(t)
         event["chunks_retrieved"] = len(docs)
         event["docs_in_context"] = len({d["metadata"].get("source") for d in docs})
 
-        return {"docs": docs, "match": match, "expanded_query": expanded_query, "glossary_keys": glossary_keys}
+        return {"docs": docs, "match": match, "title_hits": title_hits,
+                "expanded_query": expanded_query, "glossary_keys": glossary_keys}
 
     def _timed_query(self, timings: Dict[str, int], key: str, *args, **kwargs) -> Dict[str, Any]:
         t = time.perf_counter()
@@ -136,40 +138,73 @@ class RAGService:
         finally:
             timings[key] = _ms(t)
 
-    def _targeted_doc_numbers(self, match: Optional[MatchResult]) -> List[str]:
-        """Documents to pull chunks from first: exact matches, then top partial matches."""
-        if not match:
-            return []
-        nums = [e.document_number for e in match.exact]
-        nums += [e.document_number for e in match.partial[:self.config.id_candidates_max]]
+    def _targeted_doc_numbers(self, match: Optional[MatchResult], title_nums: List[str]) -> List[str]:
+        """Documents to pull chunks from first: exact, top partial (title-matched first), then title matches."""
+        nums: List[str] = []
+        if match:
+            nums += [e.document_number for e in match.exact]
+            partial = sorted(match.partial, key=lambda e: e.document_number not in title_nums)  # stable
+            match.partial = partial
+            nums += [e.document_number for e in partial[:self.config.id_candidates_max]]
+        nums += title_nums
         return list(dict.fromkeys(nums))
 
+    def _search_titles(self, query_embedding: List[float], timings: Dict[str, int],
+                       event: dict, title_hits: list) -> List[str]:
+        """Title search on the index; returns document numbers scoring >= title_min_score."""
+        t = time.perf_counter()
+        try:
+            hits = self.document_index.search_titles(query_embedding)
+        except Exception as e:
+            logger.warning(f"Title search failed: {e}", exc_info=True)
+            event["title_search_failed"] = True
+            hits = []
+        timings["title_search"] = _ms(t)
+        strong = [(entry, score) for entry, score in hits if score >= self.config.title_min_score]
+        title_hits.extend(strong)
+        event["title_hits"] = len(strong)
+        event["title_top_score"] = round(hits[0][1], 4) if hits else None
+        event["title_top"] = hits[0][0].document_number if hits else None
+        return [entry.document_number for entry, _ in strong]
+
     def _search_targeted(self, query_embedding: List[float], timings: Dict[str, int],
-                         match: Optional[MatchResult], event: dict) -> Dict[str, Any]:
-        """Most relevant chunks *within* documents matched by number. Never fails the request."""
-        doc_numbers = self._targeted_doc_numbers(match)
+                         match: Optional[MatchResult], event: dict, title_hits: list = None) -> Dict[str, Any]:
+        """Most relevant chunks *within* documents matched by number or title. Never fails the request."""
+        title_nums = self._search_titles(query_embedding, timings, event,
+                                         title_hits if title_hits is not None else [])
+        doc_numbers = self._targeted_doc_numbers(match, title_nums)
         event["targeted_docs"] = len(doc_numbers)
         if not doc_numbers:
             return {}
         try:
-            return self._timed_query(
+            results = self._timed_query(
                 timings, "doc_number_search", query_embedding,
                 n_results=self.config.doc_number_n_results,
                 where={"$and": [{"document_number": {"$in": doc_numbers}}, {"active": True}]},
             )
+            # Keep priority order (exact → partial → title); Chroma's similarity order within each document
+            if results.get("ids") and results["ids"][0]:
+                rank = {n: i for i, n in enumerate(doc_numbers)}
+                rows = list(zip(results["ids"][0], results["documents"][0], results["metadatas"][0]))
+                rows.sort(key=lambda r: rank.get(r[2].get("document_number"), len(rank)))
+                results = {"ids": [[r[0] for r in rows]], "documents": [[r[1] for r in rows]],
+                           "metadatas": [[r[2] for r in rows]]}
+            return results
         except Exception as e:
             logger.warning(f"Document number search failed: {e}", exc_info=True)
             event["doc_number_search_failed"] = True
             return {}
 
     def _search_documents(self, query_embedding: List[float], timings: Dict[str, int] = None,
-                          match: Optional[MatchResult] = None, event: dict = None) -> List[Dict[str, Any]]:
+                          match: Optional[MatchResult] = None, event: dict = None,
+                          title_hits: list = None) -> List[Dict[str, Any]]:
         """
         Args:
             query_embedding: Query embedding vector
             timings: Dict to record search timings into (optional)
             match: Document numbers matched in the query (optional)
             event: Analytics event to add counts to (optional)
+            title_hits: List that receives strong title matches [(entry, score)] (optional)
         Returns:
             List of document dictionaries with content and metadata
         """
@@ -186,7 +221,7 @@ class RAGService:
                 self._timed_query, timings, "semantic_search",
                 query_embedding, n_results=self.config.n_results * 2
             )
-            targeted_future = pool.submit(self._search_targeted, query_embedding, timings, match, event)
+            targeted_future = pool.submit(self._search_targeted, query_embedding, timings, match, event, title_hits)
             semantic_results = semantic_future.result()
             targeted_results = targeted_future.result()
 
