@@ -29,7 +29,7 @@ class Config:
     # Query settings
     n_results: int = 30
     max_tokens: int = 5000
-    temperature: float = 0.7 # Lower the more accurate
+    temperature: float = 0.1 # Lower the more accurate
 
     # Document index (number / title lookups)
     index_refresh_s: int = 600         # re-check the index every 10 min

@@ -61,22 +61,20 @@ class RAGService:
             # Generate response
             stage = "llm"
             t = time.perf_counter()
-            response_text, tokens = self._generate_response(
+            response_text, tokens, tag_map = self._generate_response(
                 docs, retrieval["expanded_query"], retrieval["glossary_keys"]
             )
             timings["llm"] = _ms(t)
             event.update(tokens)
             stage = "links"
 
-            # Build metadata lookup for document linker
-            doc_metadata = {}
-            for doc in docs:
-                source = doc["metadata"].get("source", "")
-                if source and source not in doc_metadata:
-                    doc_metadata[source] = doc["metadata"]
-
-            # Add SharePoint links
-            final_response = self.document_linker.add_links_to_response(response_text, doc_metadata)
+            # Names and SharePoint links come from metadata, never from the model
+            final_response, link_stats = self.document_linker.render(response_text, tag_map)
+            cited_numbers = [tag_map[t].get("document_number") for t in link_stats.pop("cited")]
+            event.update(link_stats)
+            section = self.document_linker.matches_section(retrieval["match"], cited_numbers)
+            if section:
+                final_response = f"{final_response}\n\n{section}"
 
             return final_response
 
@@ -267,41 +265,48 @@ class RAGService:
             query: Expanded user query
             glossary_keys: Glossary entries matched in the query (only these go in the prompt)
         Returns:
-            (response text, token usage)
+            (response text, token usage, {tag: metadata})
         """
         # Build context from documents
-        context_text = self._build_context(docs)
+        context_text, tag_map = self._build_context(docs)
 
         # Add glossary to context
         glossary_text = self.glossary_manager.get_glossary_text(glossary_keys)
         context_with_glossary = f"{glossary_text}\n\n{context_text}"
 
         # Generate response
-        return self.openai_client.generate_chat_response(
+        text, tokens = self.openai_client.generate_chat_response(
             PROMPT_TEMPLATE,
             context=context_with_glossary,
             question=query
         )
+        return text, tokens, tag_map
 
-    def _build_context(self, docs: List[Dict]) -> str:
+    def _build_context(self, docs: List[Dict]):
         """
         Args:
             docs: List of document dictionaries
 
         Returns:
-            str: Formatted context text
+            (formatted context text, {tag: metadata}) — one tag per distinct document
         """
         context_parts = []
+        tag_by_source: Dict[str, str] = {}
+        tag_map: Dict[str, dict] = {}
         for doc in docs:
             source = doc["metadata"].get("source", "Unknown")
+            if source not in tag_by_source:
+                tag = f"D{len(tag_by_source) + 1}"
+                tag_by_source[source] = tag
+                tag_map[tag] = doc["metadata"]
             page = doc["metadata"].get("page_label",
                                       doc["metadata"].get("page", "N/A"))
             content = doc["page_content"]
 
             context_parts.append(
-                f'Document: "{source}"\n'
+                f'[{tag_by_source[source]}] Document title: {source}\n'
                 f'Page: {page}\n\n'
                 f'{content}'
             )
 
-        return "\n\n---\n\n".join(context_parts)
+        return "\n\n---\n\n".join(context_parts), tag_map
