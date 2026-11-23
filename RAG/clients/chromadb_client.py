@@ -22,13 +22,11 @@ class ChromaDBClient:
         )
         self.collection = self.client.get_collection(name=config.chromadb_collection)
     
-    def query_collection(self, query_embedding: List[float], n_results: int = None,
-                         where: Dict[str, Any] = None) -> Dict[str, Any]:
+    def query_collection(self, query_embedding: List[float], n_results: int = None) -> Dict[str, Any]:
         """     
         Args:
             query_embedding: Query embedding vector
-            n_results: Number of results to return
-            where: Optional metadata filter
+            n_results: Number of results to return        
         Returns:
             Dict containing query results
         """
@@ -39,7 +37,6 @@ class ChromaDBClient:
         results = self.collection.query(
             query_embeddings=[query_embedding],
             n_results=n_results,
-            where=where,
             include=["metadatas", "documents"]
         )
         
