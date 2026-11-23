@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -13,6 +14,15 @@ from ..prompts import PROMPT_TEMPLATE
 from ..utils.analytics import log_event
 
 logger = logging.getLogger(__name__)
+
+# Wording that asks for a document rather than about its content
+_LOOKUP_RE = re.compile(
+    r"\b(find|link|links|url|open|download|locate|show\s+me|get\s+me|give\s+me|send\s+me|"
+    r"where\s+(?:is|are|can\s+i\s+(?:find|get))|which\s+document)\b",
+    re.IGNORECASE,
+)
+_FILLER = {"the", "a", "an", "doc", "docs", "document", "documents", "standard", "standards", "pdf",
+           "file", "please", "pls", "for", "of", "and", "me", "to", "is", "it", "this", "that", "code"}
 
 
 def _ms(start: float) -> int:
@@ -48,10 +58,17 @@ class RAGService:
         timings: Dict[str, int] = {}
         event["timings_ms"] = timings
         t_total = time.perf_counter()
-        stage = "retrieve"
+        stage = "number_match"
 
         try:
-            retrieval = self.retrieve(query_text, event, timings)
+            match = self._match_numbers(query_text, event, timings)
+            if self._is_lookup(query_text, match):
+                # Fast path: the user wants the document itself — answer from the index, no LLM
+                event["route"] = "fast_path"
+                return self._fast_path_response(match)
+
+            stage = "retrieve"
+            retrieval = self.retrieve(query_text, event, timings, match)
             docs = retrieval["docs"]
 
             if not docs:
@@ -87,15 +104,8 @@ class RAGService:
             timings["total"] = _ms(t_total)
             log_event("rag_query", **event)
 
-    def retrieve(self, query_text: str, event: dict = None, timings: Dict[str, int] = None) -> Dict[str, Any]:
-        """Glossary → number matching → embedding → searches. No LLM call.
-
-        Returns {"docs", "match", "expanded_query", "glossary_keys"} and fills event / timings.
-        """
-        event = event if event is not None else {}
-        timings = timings if timings is not None else {}
-
-        # Document numbers are matched on the raw query, before glossary expansion
+    def _match_numbers(self, query_text: str, event: dict, timings: Dict[str, int]) -> MatchResult:
+        """Document numbers are matched on the raw query, before glossary expansion."""
         t = time.perf_counter()
         self.document_index.ensure_fresh()
         match = self.document_index.match_numbers(query_text)
@@ -104,6 +114,42 @@ class RAGService:
         event["index_source"] = self.document_index.source.name
         event["index_entries"] = len(self.document_index.entries)
         event["index_age_s"] = self.document_index.age_s
+        return match
+
+    @staticmethod
+    def _is_lookup(query_text: str, match: MatchResult) -> bool:
+        """Exact number match, nothing missing, and either lookup wording or nothing else asked."""
+        if not match.exact or match.not_found:
+            return False
+        if _LOOKUP_RE.search(query_text):
+            return True
+        title_words = {w.lower() for e in match.exact for w in re.findall(r"[A-Za-z]+", e.title or e.file_name)}
+        stripped = query_text
+        for e in match.exact:
+            stripped = re.sub(r"[-\s_]?".join(re.escape(c) for c in e.norm), " ", stripped, flags=re.IGNORECASE)
+        remaining = [w for w in re.findall(r"[A-Za-z0-9]+", stripped.lower())
+                     if w not in _FILLER and w not in title_words]
+        return not remaining
+
+    def _fast_path_response(self, match: MatchResult) -> str:
+        lines = ["## 1. Suggested Documents:"]
+        for e in match.exact:
+            link = self.document_linker.link({"source": e.file_name or e.document_number,
+                                              "sharepoint_item_url": e.sharepoint_item_url})
+            lines.append(f"- {link} - document {e.document_number}")
+        return "\n".join(lines)
+
+    def retrieve(self, query_text: str, event: dict = None, timings: Dict[str, int] = None,
+                 match: MatchResult = None) -> Dict[str, Any]:
+        """(Number matching →) glossary → embedding → searches. No LLM call.
+
+        Returns {"docs", "match", "title_hits", "expanded_query", "glossary_keys"} and fills event / timings.
+        """
+        event = event if event is not None else {}
+        timings = timings if timings is not None else {}
+
+        if match is None:
+            match = self._match_numbers(query_text, event, timings)
 
         # Expand acronyms in query (reloads the glossary first if the file changed)
         t = time.perf_counter()
