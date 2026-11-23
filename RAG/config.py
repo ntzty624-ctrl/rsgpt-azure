@@ -28,6 +28,7 @@ class Config:
     
     # Query settings
     n_results: int = 30
+    doc_number_n_results: int = 10  # max chunks taken from documents named in the query
     max_tokens: int = 5000
     temperature: float = 0.7 # Lower the more accurate
     
