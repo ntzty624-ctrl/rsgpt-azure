@@ -35,8 +35,9 @@ class RAGService:
         logger.info(f"Processing query: {query_text[:100]}...")
         
         try:
-            # Expand acronyms in query
-            expanded_query = self.glossary_manager.expand_acronyms(query_text)
+            # Expand acronyms in query (reloads the glossary first if the file changed)
+            self.glossary_manager.reload_if_changed()
+            expanded_query, glossary_keys = self.glossary_manager.expand_acronyms(query_text)
             logger.debug(f"Expanded query: {expanded_query}")
             
             # Generate embedding for query
@@ -49,7 +50,7 @@ class RAGService:
                 return "No relevant documents found."
             
             # Generate response
-            response_text = self._generate_response(docs, expanded_query)
+            response_text = self._generate_response(docs, expanded_query, glossary_keys)
             
             # Build metadata lookup for document linker
             doc_metadata = {}
@@ -107,13 +108,14 @@ class RAGService:
         logger.info(f"Found {len(docs)} relevant documents")
         return docs
     
-    def _generate_response(self, docs: List[Dict], query: str) -> str:
+    def _generate_response(self, docs: List[Dict], query: str, glossary_keys: List[str] = None) -> str:
         """
         Generate response using OpenAI based on retrieved documents.
         
         Args:
             docs: List of document dictionaries
-            query: Expanded user query    
+            query: Expanded user query
+            glossary_keys: Glossary entries matched in the query (only these go in the prompt)
         Returns:
             str: Generated response text
         """
@@ -121,7 +123,7 @@ class RAGService:
         context_text = self._build_context(docs)
         
         # Add glossary to context
-        glossary_text = self.glossary_manager.get_glossary_text()
+        glossary_text = self.glossary_manager.get_glossary_text(glossary_keys)
         context_with_glossary = f"{glossary_text}\n\n{context_text}"
         
         # Generate response
