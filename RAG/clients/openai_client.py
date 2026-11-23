@@ -1,6 +1,6 @@
 import logging
 import openai
-from typing import List
+from typing import Dict, List, Tuple
 from langchain.prompts import ChatPromptTemplate
 
 logger = logging.getLogger(__name__)
@@ -39,13 +39,13 @@ class OpenAIClient:
         
         return response.data[0].embedding
     
-    def generate_chat_response(self, template: str, **kwargs) -> str:
+    def generate_chat_response(self, template: str, **kwargs) -> Tuple[str, Dict[str, int]]:
         """   
         Args:
             template: Prompt template string
             **kwargs: Template variables           
         Returns:
-            str: Generated response text
+            (response text, token usage {"prompt_tokens", "completion_tokens"})
         """
         prompt_template = ChatPromptTemplate.from_template(template)
         prompt = prompt_template.format(**kwargs)
@@ -65,4 +65,9 @@ class OpenAIClient:
             temperature=self.config.temperature
         )
         
-        return response.choices[0].message.content
+        usage = getattr(response, "usage", None)
+        tokens = {
+            "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+            "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+        }
+        return response.choices[0].message.content, tokens
