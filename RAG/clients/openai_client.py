@@ -39,6 +39,15 @@ class OpenAIClient:
         
         return response.data[0].embedding
     
+    def generate_embeddings(self, texts: List[str]) -> Tuple[List[List[float]], int]:
+        """Embed several texts in one call. Returns (embeddings, total tokens)."""
+        response = self.client.embeddings.create(
+            model=self.config.azure_embedding_deployment,
+            input=texts
+        )
+        usage = getattr(response, "usage", None)
+        return [d.embedding for d in response.data], getattr(usage, "total_tokens", 0) or 0
+
     def generate_chat_response(self, template: str, **kwargs) -> Tuple[str, Dict[str, int]]:
         """   
         Args:

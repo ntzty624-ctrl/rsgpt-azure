@@ -5,6 +5,9 @@ title lookups.
 Where the entries come from is pluggable (the "source"). The base EmptySource has no
 entries, which turns number matching and title search off (old behaviour).
 """
+import hashlib
+import json
+import os
 import re
 import time
 import logging
@@ -252,6 +255,87 @@ class DocumentIndex:
         return [(self.by_number[n], score) for n, score in hits if n in self.by_number]
 
 
+def _title_from_file_name(file_name: str, document_number: str) -> str:
+    """'C-ST-FO-4110 Formation.pdf' -> 'Formation' (same rule as rs-gpt document_index.py)."""
+    stem = os.path.splitext(file_name)[0]
+    if document_number and stem.upper().startswith(document_number.upper()):
+        stem = stem[len(document_number):]
+    return stem.strip(" -_")
+
+
+class DerivedSource:
+    """Index entries built by the Function itself from chunk 0 of each active document.
+
+    Titles are embedded here (batches of 100) and kept in memory; on refresh only new or
+    changed titles are embedded. Title search is an in-memory cosine similarity.
+    No rs-gpt changes needed and the index can never drift from the main collection.
+    """
+    name = "derived"
+    batch_size = 100
+
+    def __init__(self, chromadb_client, openai_client):
+        self.collection = chromadb_client.collection
+        self.openai_client = openai_client
+        self._vectors: Dict[str, List[float]] = {}  # index text -> embedding
+        self._numbers: List[str] = []
+        self._matrix = None
+
+    def load(self, previous_marker: Optional[str]):
+        import numpy as np
+
+        t = time.perf_counter()
+        rows = self.collection.get(
+            where={"$and": [{"active": True}, {"chunk_index": 0}]}, include=["metadatas"]
+        )["metadatas"]
+        read_ms = round((time.perf_counter() - t) * 1000)
+
+        entries: Dict[str, dict] = {}
+        for meta in rows:
+            num = meta.get("document_number")
+            if not num or num in entries:
+                continue
+            file_name = meta.get("file_name", "")
+            entries[num] = {"document_number": num, "file_name": file_name,
+                            "title": _title_from_file_name(file_name, num),
+                            "sharepoint_item_url": meta.get("sharepoint_item_url", "")}
+        marker = hashlib.sha1(json.dumps(sorted(entries.items())).encode()).hexdigest()
+        if previous_marker is not None and marker == previous_marker:
+            return None, marker, {"read_ms": read_ms, "embed_calls": 0, "embed_texts": 0, "embed_tokens": 0}
+
+        texts = {num: f"{num} {e['title']}".strip() for num, e in entries.items()}
+        missing = [x for x in dict.fromkeys(texts.values()) if x not in self._vectors]
+        t = time.perf_counter()
+        calls = tokens = 0
+        for i in range(0, len(missing), self.batch_size):
+            batch = missing[i:i + self.batch_size]
+            vectors, used = self.openai_client.generate_embeddings(batch)
+            self._vectors.update(zip(batch, vectors))
+            calls += 1
+            tokens += used
+        embed_ms = round((time.perf_counter() - t) * 1000)
+        self._vectors = {x: self._vectors[x] for x in texts.values()}  # drop stale titles
+
+        self._numbers = list(texts)
+        matrix = np.array([self._vectors[texts[n]] for n in self._numbers], dtype=np.float32)
+        if len(matrix):
+            matrix /= np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-12
+        self._matrix = matrix
+        return list(entries.values()), marker, {"read_ms": read_ms, "embed_ms": embed_ms, "embed_calls": calls,
+                                                "embed_texts": len(missing), "embed_tokens": tokens}
+
+    def title_search(self, index: DocumentIndex, query_embedding: List[float], k: int) -> List[Tuple[str, float]]:
+        import numpy as np
+
+        if self._matrix is None or not len(self._matrix):
+            return []
+        q = np.asarray(query_embedding, dtype=np.float32)
+        scores = self._matrix @ (q / (np.linalg.norm(q) + 1e-12))
+        top = np.argsort(-scores)[:k]
+        return [(self._numbers[i], float(scores[i])) for i in top]
+
+
 def create_document_index(config, chromadb_client=None, openai_client=None) -> DocumentIndex:
-    """Build the DocumentIndex with the configured source (base: no source)."""
-    return DocumentIndex(config, EmptySource())
+    """Build the DocumentIndex with the configured source (this branch: derived in the Function)."""
+    if chromadb_client is None or openai_client is None:
+        return DocumentIndex(config, EmptySource())
+    return DocumentIndex(config, DerivedSource(chromadb_client, openai_client))
