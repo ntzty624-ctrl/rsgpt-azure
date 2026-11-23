@@ -30,6 +30,14 @@ class Config:
     n_results: int = 30
     max_tokens: int = 5000
     temperature: float = 0.7 # Lower the more accurate
+
+    # Document index (number / title lookups)
+    index_refresh_s: int = 600         # re-check the index every 10 min
+    doc_number_n_results: int = 10     # max chunks taken from documents matched by number/title
+    id_candidates_max: int = 5         # max partial / nearest candidates used and listed
+    nearest_max_distance: int = 3      # bare "001" → nearest only within this distance
+    title_search_k: int = 5            # title matches considered per query
+    title_min_score: float = 0.85      # similarity needed for a title match to count
     
     def __post_init__(self):
         
