@@ -17,6 +17,7 @@ class Config:
     chromadb_port: int = None
     chromadb_token: str = None
     chromadb_collection: str = "documents"
+    chromadb_index_collection: str = "document_index"  # written by rs-gpt document_index.py
     
     # File paths - Mounted file share
     base_dir: str = None

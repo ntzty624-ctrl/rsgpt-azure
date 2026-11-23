@@ -252,6 +252,49 @@ class DocumentIndex:
         return [(self.by_number[n], score) for n, score in hits if n in self.by_number]
 
 
+class CollectionSource:
+    """Index entries from the document_index collection written by rs-gpt (document_index.py).
+
+    Only metadatas are downloaded (~600 small rows); embeddings stay in Chroma and title
+    search is a query on that collection. Reloads only when the collection's
+    updated_at marker changes.
+    """
+    name = "collection"
+
+    def __init__(self, chromadb_client, config):
+        self.client = chromadb_client.client
+        self.collection_name = config.chromadb_index_collection
+        self._collection = None
+
+    def load(self, previous_marker: Optional[str]):
+        t = time.perf_counter()
+        col = self.client.get_collection(name=self.collection_name)  # re-fetched to see a new updated_at
+        self._collection = col
+        marker = (col.metadata or {}).get("updated_at")
+        check_ms = round((time.perf_counter() - t) * 1000)
+        if previous_marker is not None and marker == previous_marker:
+            return None, marker, {"check_ms": check_ms, "index_updated_at": marker}
+        t = time.perf_counter()
+        rows = col.get(include=["metadatas"])["metadatas"]
+        return rows, marker, {"check_ms": check_ms, "read_ms": round((time.perf_counter() - t) * 1000),
+                              "index_updated_at": marker}
+
+    def title_search(self, index: DocumentIndex, query_embedding: List[float], k: int) -> List[Tuple[str, float]]:
+        col = self._collection
+        if col is None:
+            return []
+        r = col.query(query_embeddings=[query_embedding], n_results=k, include=["metadatas", "distances"])
+        space = (col.metadata or {}).get("hnsw:space", "l2")
+        hits = []
+        for meta, dist in zip(r["metadatas"][0], r["distances"][0]):
+            # Chroma l2 is squared distance; for unit-length embeddings cos = 1 - d/2
+            score = 1 - dist if space == "cosine" else 1 - dist / 2
+            hits.append((meta.get("document_number"), max(0.0, score)))
+        return hits
+
+
 def create_document_index(config, chromadb_client=None, openai_client=None) -> DocumentIndex:
-    """Build the DocumentIndex with the configured source (base: no source)."""
-    return DocumentIndex(config, EmptySource())
+    """Build the DocumentIndex with the configured source (this branch: document_index collection)."""
+    if chromadb_client is None:
+        return DocumentIndex(config, EmptySource())
+    return DocumentIndex(config, CollectionSource(chromadb_client, config))
