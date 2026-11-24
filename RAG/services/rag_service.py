@@ -79,7 +79,7 @@ class RAGService:
             stage = "llm"
             t = time.perf_counter()
             response_text, tokens, tag_map = self._generate_response(
-                docs, retrieval["expanded_query"], retrieval["glossary_keys"]
+                docs, query_text, retrieval["glossary_keys"]
             )
             timings["llm"] = _ms(t)
             event.update(tokens)
@@ -143,7 +143,7 @@ class RAGService:
                  match: MatchResult = None) -> Dict[str, Any]:
         """(Number matching →) glossary → embedding → searches. No LLM call.
 
-        Returns {"docs", "match", "title_hits", "expanded_query", "glossary_keys"} and fills event / timings.
+        Returns {"docs", "match", "title_hits", "search_query", "glossary_keys"} and fills event / timings.
         """
         event = event if event is not None else {}
         timings = timings if timings is not None else {}
@@ -151,17 +151,21 @@ class RAGService:
         if match is None:
             match = self._match_numbers(query_text, event, timings)
 
-        # Expand acronyms in query (reloads the glossary first if the file changed)
+        # Abbreviations are hints, not facts: the question is never rewritten
+        # (reloads the glossary first if the file changed)
         t = time.perf_counter()
         self.glossary_manager.reload_if_changed()
-        expanded_query, glossary_keys = self.glossary_manager.expand_acronyms(query_text)
+        glossary_keys = self.glossary_manager.find_acronyms(query_text)
+        search_query = self.glossary_manager.search_text(query_text, glossary_keys, self.config.glossary_in_search)
         timings["glossary"] = _ms(t)
+        event["glossary_mode"] = self.config.glossary_in_search
         event["glossary_matched"] = len(glossary_keys)
-        logger.debug(f"Expanded query: {expanded_query}")
+        event["glossary_meanings"] = sum(len(self.glossary_manager.glossary_dict.get(k, [])) for k in glossary_keys)
+        logger.debug(f"Search query: {search_query}")
 
         # Generate embedding for query
         t = time.perf_counter()
-        query_embedding = self.openai_client.generate_embedding(expanded_query)
+        query_embedding = self.openai_client.generate_embedding(search_query)
         timings["embed"] = _ms(t)
 
         # Search for relevant documents
@@ -173,7 +177,7 @@ class RAGService:
         event["docs_in_context"] = len({d["metadata"].get("source") for d in docs})
 
         return {"docs": docs, "match": match, "title_hits": title_hits,
-                "expanded_query": expanded_query, "glossary_keys": glossary_keys}
+                "search_query": search_query, "glossary_keys": glossary_keys}
 
     def _timed_query(self, timings: Dict[str, int], key: str, *args, **kwargs) -> Dict[str, Any]:
         t = time.perf_counter()
@@ -308,7 +312,7 @@ class RAGService:
 
         Args:
             docs: List of document dictionaries
-            query: Expanded user query
+            query: User query as typed
             glossary_keys: Glossary entries matched in the query (only these go in the prompt)
         Returns:
             (response text, token usage, {tag: metadata})
@@ -317,7 +321,7 @@ class RAGService:
         context_text, tag_map = self._build_context(docs)
 
         # Add glossary to context
-        glossary_text = self.glossary_manager.get_glossary_text(glossary_keys)
+        glossary_text = self.glossary_manager.get_glossary_text(glossary_keys)  # possible meanings only
         context_with_glossary = f"{glossary_text}\n\n{context_text}"
 
         # Generate response

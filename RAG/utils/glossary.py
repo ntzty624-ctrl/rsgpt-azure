@@ -6,6 +6,7 @@ import threading
 from typing import Dict, List, Tuple
 
 from .analytics import log_event
+from .document_index import QUERY_NUMBER_RE
 
 logger = logging.getLogger(__name__)
 
@@ -13,11 +14,16 @@ _ENTRY_RE = re.compile(r"^-\s*(.+?)\s*:\s*(.+?)\s*$")
 
 
 class GlossaryManager:
-    """Loads the hand-maintained glossary and reloads it when the file changes."""
+    """Loads the hand-maintained glossary and reloads it when the file changes.
+
+    Abbreviations are treated as *possible* meanings: the question is never rewritten.
+    Meanings are offered to the model as hints, and (mode "hint") appended to the
+    searched text.
+    """
 
     def __init__(self, config):
         self.config = config
-        self.glossary_dict: Dict[str, str] = {}
+        self.glossary_dict: Dict[str, List[str]] = {}
         self._pattern = None
         self._mtime = None
         self._missing_logged = False
@@ -54,7 +60,7 @@ class GlossaryManager:
             glossary, unparsed = self._parse(content)
             self.glossary_dict = glossary
             # Longest keys first so e.g. "STE" wins over "ST". Keys inside hyphenated
-            # tokens (document numbers such as C-ST-FO-4110) are never expanded.
+            # tokens (document numbers such as C-ST-FO-4110) never match.
             keys = sorted(glossary, key=len, reverse=True)
             self._pattern = re.compile(
                 r'(?<![\w-])(' + '|'.join(re.escape(k) for k in keys) + r')(?![\w-])'
@@ -66,12 +72,14 @@ class GlossaryManager:
                 logger.warning(f"Glossary: {len(unparsed)} line(s) not in '- KEY: value' format, "
                                f"e.g. {unparsed[:3]}")
             log_event("glossary_load", entries=len(glossary), unparsed_lines=len(unparsed),
+                      multi_meaning_keys=sum(len(v) > 1 for v in glossary.values()),
                       load_ms=round((time.perf_counter() - t) * 1000), trigger=trigger)
             return True
 
     @staticmethod
-    def _parse(content: str) -> Tuple[Dict[str, str], List[str]]:
-        glossary: Dict[str, str] = {}
+    def _parse(content: str) -> Tuple[Dict[str, List[str]], List[str]]:
+        """Repeated keys keep every meaning, e.g. ST: Standard and ST: Station."""
+        glossary: Dict[str, List[str]] = {}
         unparsed: List[str] = []
         for line in content.strip().splitlines():
             line = line.strip()
@@ -79,35 +87,45 @@ class GlossaryManager:
                 continue
             m = _ENTRY_RE.match(line)
             if m:
-                glossary[m.group(1)] = m.group(2)
+                meanings = glossary.setdefault(m.group(1), [])
+                if m.group(2) not in meanings:
+                    meanings.append(m.group(2))
             else:
                 unparsed.append(line)
         return glossary, unparsed
 
-    def expand_acronyms(self, text: str) -> Tuple[str, List[str]]:
-        """Expand acronyms as 'ST (Standard)', keeping the acronym itself.
-
-        Returns (expanded_text, matched_keys).
-        """
+    def find_acronyms(self, text: str) -> List[str]:
+        """Glossary keys in the text, skipping anything that looks like a document number
+        (including spaced forms such as 'C ST FO 4110' or 'SIN A01 002')."""
         if not self._pattern:
-            return text, []
+            return []
+        protected = [m.span() for m in QUERY_NUMBER_RE.finditer(text)]
+        found: List[str] = []
+        for m in self._pattern.finditer(text):
+            if any(a <= m.start() < b for a, b in protected):
+                continue
+            if m.group(1) not in found:
+                found.append(m.group(1))
+        if found:
+            logger.debug(f"Abbreviations in query: {found}")
+        return found
 
-        matched: List[str] = []
-
-        def repl(m):
-            key = m.group(1)
-            if key not in matched:
-                matched.append(key)
-            return f"{key} ({self.glossary_dict[key]})"
-
-        expanded = self._pattern.sub(repl, text)
-        if matched:
-            logger.debug(f"Expanded acronyms in query: {matched}")
-        return expanded, matched
+    def search_text(self, text: str, keys: List[str], mode: str = "hint") -> str:
+        """Text to embed. 'hint' appends possible meanings; 'off' leaves the text as typed."""
+        if mode != "hint" or not keys:
+            return text
+        hints = "; ".join(f"{k} = {' / '.join(self.glossary_dict[k])}" for k in keys if k in self.glossary_dict)
+        return f"{text} — possible meanings: {hints}" if hints else text
 
     def get_glossary_text(self, keys: List[str] = None) -> str:
-        """Glossary lines for the prompt — only the given keys (none → empty)."""
+        """Possible meanings for the prompt — only the given keys (none → empty)."""
         if not keys:
             return ""
-        lines = [f"- {k}: {self.glossary_dict[k]}" for k in keys if k in self.glossary_dict]
-        return "Glossary:\n" + "\n".join(lines) if lines else ""
+        lines = [
+            f"- {k}: possibly " + " or ".join(f'"{v}"' for v in self.glossary_dict[k])
+            for k in keys if k in self.glossary_dict
+        ]
+        if not lines:
+            return ""
+        return ("Possible meanings of abbreviations in the question "
+                "(they may not apply; decide from the context):\n" + "\n".join(lines))
