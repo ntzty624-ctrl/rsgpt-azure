@@ -22,6 +22,7 @@ class Config:
     base_dir: str = None
     mount_path: str = None
     glossary_file: str = "glossary.txt"
+    glossary_in_search: str = None  # "hint" (default): append possible meanings to searched text; "off"
     
     # SharePoint 
     sharepoint_prefix: str = "https://kiwirail.sharepoint.com/"
@@ -50,6 +51,7 @@ class Config:
         self.chromadb_port = int(os.getenv("CHROMADB_PORT", 8000))
         self.chromadb_token = os.getenv("CHROMADB_TOKEN", "")
         self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.glossary_in_search = os.getenv("GLOSSARY_IN_SEARCH", "hint").strip().lower()
         
         # Mount path configuration - uses /mnt/fileshare from Azure file share mount
         self.mount_path = "/mnt/fileshare"

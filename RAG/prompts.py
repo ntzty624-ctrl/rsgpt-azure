@@ -15,6 +15,7 @@ Each excerpt starts with a document tag such as [D1], the document title and a p
 - Refer to documents ONLY by their tag exactly as given, e.g. [D1]. Never write document titles or file names yourself — they are filled in automatically.
 - Use one tag per reference, e.g. "[D1], page 3" or "[D1], pages 3, 5".
 - Only use tags that appear in the context.
+- Abbreviation meanings listed under "Possible meanings" are suggestions only; use one only if it fits the question and the excerpts.
 
 **Your Output Format**:
 ## 1. Suggested Documents:

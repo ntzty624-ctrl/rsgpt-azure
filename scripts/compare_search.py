@@ -93,6 +93,10 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Sampling seed (keep the same across branches)")
     parser.add_argument("--cases", type=str, default=None, help="Optional CSV: query,expected_document_number")
     parser.add_argument("--out", type=str, default="compare_search.json", help="Output JSON path")
+    parser.add_argument("--glossary", type=str, default=None,
+                        help="Local copy of glossary.txt (the Function reads it from /mnt/fileshare)")
+    parser.add_argument("--glossary-mode", choices=["hint", "off"], default=None,
+                        help="Override GLOSSARY_IN_SEARCH for this run")
     args = parser.parse_args()
 
     collector = _EventCollector()
@@ -102,6 +106,10 @@ def main():
     analytics_logger.addHandler(collector)
 
     config = Config()
+    if args.glossary:
+        config.get_glossary_path = lambda: args.glossary
+    if args.glossary_mode:
+        config.glossary_in_search = args.glossary_mode
 
     # Cold start: service construction + first index load
     t = time.perf_counter()
@@ -174,6 +182,9 @@ def main():
 
     report = {
         "index_source": index.source.name,
+        "glossary_mode": config.glossary_in_search,
+        "glossary_path": config.get_glossary_path(),
+        "glossary_entries": len(service.glossary_manager.glossary_dict),
         "index_entries": len(index.entries),
         "init_ms": init_ms,
         "cold_load_ms": cold_load_ms,
@@ -190,6 +201,7 @@ def main():
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, default=str)
 
+    print(f"Glossary: {report['glossary_entries']} entries, mode {report['glossary_mode']}")
     print(f"Index source: {report['index_source']}  entries: {report['index_entries']}  "
           f"cold load: {cold_load_ms} ms  refresh: {refresh_ms} ms  init: {init_ms} ms")
     print(f"Drift: {len(report['drift']['missing_from_index'])} missing from index, "
